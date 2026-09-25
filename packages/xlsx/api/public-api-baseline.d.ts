@@ -1238,6 +1238,9 @@ export interface ImageAnchor {
     editAs?: string;
     nativeExtCx: number;
     nativeExtCy: number;
+    rotation?: number;
+    flipH?: boolean;
+    flipV?: boolean;
     imagePath: string;
     mimeType: string;
     svgImagePath?: string;
