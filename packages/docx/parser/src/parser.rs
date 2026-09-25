@@ -34,6 +34,10 @@ use crate::xml_util::*;
 
 const DEFAULT_FONT_SIZE: f64 = 10.0; // pt fallback
 
+#[cfg(test)]
+#[path = "parser/numbering_safety_tests.rs"]
+mod numbering_safety_tests;
+
 /// DOCX-local adapter over one owned, validated package session. Every public
 /// call owns one explicit operation. Focused parser tests lazily receive a
 /// compatibility operation while using the same bounded decoder path.
@@ -636,7 +640,7 @@ fn resolve_section_refs(
         .filter(|n| n.is_element() && n.tag_name().name() == "sectPr")
     {
         merge_section_refs(sp, rel_map, &mut running);
-        let title_page = child_w(sp, "titlePg").is_some();
+        let title_page = bool_prop(sp, "titlePg").unwrap_or(false);
         out.push((sp.id(), running.clone(), title_page));
     }
     out
@@ -989,7 +993,7 @@ fn preflight_document_body(
                 merge_section_refs(node, &environment.rel_map, &mut running_refs);
                 sections.push(StreamedSectionFact {
                     refs: running_refs.clone(),
-                    title_page: child_w(node, "titlePg").is_some(),
+                    title_page: bool_prop(node, "titlePg").unwrap_or(false),
                 });
             }
         }
@@ -1282,6 +1286,13 @@ impl DocxBodyCursor {
             }
         }
 
+        environment
+            .num_map
+            .check_counter_error()
+            .map_err(|error| DocumentCursorFailure {
+                error,
+                theme: Box::new(degraded_theme.clone()),
+            })?;
         let projector =
             open_document_body_projector(zip).map_err(|error| DocumentCursorFailure {
                 error,
@@ -1322,6 +1333,9 @@ impl DocxBodyCursor {
     pub(crate) fn next_unit(&mut self, zip: &mut Zip) -> Result<StreamedDocumentUnit, String> {
         if self.terminal_emitted {
             return Err("document body cursor is complete".to_string());
+        }
+        if let Some(environment) = &self.environment {
+            environment.num_map.check_counter_error()?;
         }
 
         loop {
@@ -1424,6 +1438,10 @@ impl DocxBodyCursor {
                 self.emitted_body_len,
                 Some(&mut self.diagnostics),
             );
+            // No provisional paragraph with a rejected counter may cross the
+            // pull boundary. Numbering snapshots share only this failure fact,
+            // so errors inside text-box stories cannot disappear with a clone.
+            environment.num_map.check_counter_error()?;
             self.revisions.extend(collect_revisions(root));
 
             if self.pending_cover_break && !body.is_empty() {
@@ -1517,6 +1535,7 @@ fn finish_document(
     revisions: Vec<crate::types::DocxRevision>,
     diagnostics: Vec<ParseDiagnostic>,
 ) -> Result<Document, String> {
+    environment.num_map.check_counter_error()?;
     let major_font = environment.theme.theme_font("major", "latin");
     let minor_font = environment.theme.theme_font("minor", "latin");
     // ECMA-376 §17.6.5 defines the document-grid character pitch relative to
@@ -1621,6 +1640,7 @@ fn finish_document(
         })
         .unwrap_or_default();
 
+    environment.num_map.check_counter_error()?;
     Ok(Document {
         section,
         body,
@@ -4658,7 +4678,9 @@ fn parse_section(
     props.margin_left = geom.margin_left;
     props.header_distance = geom.header_distance;
     props.footer_distance = geom.footer_distance;
-    props.title_page = child_w(sp, "titlePg").is_some();
+    // ECMA-376 17.10.6: an explicit false uses the ordinary page header;
+    // only a present element with an omitted val defaults to true.
+    props.title_page = bool_prop(sp, "titlePg").unwrap_or(false);
     // ECMA-376 §17.6.22 — the body (final) section's start type. Non-final
     // sections carry their start type on their own SectionBreak marker; the
     // paginator needs the final section's here to resolve the boundary INTO it.
@@ -4938,7 +4960,10 @@ fn resolve_numbering_marker(
     num_level: u32,
     paragraph_mark_run: &RunFmt,
     theme: &ThemeColors,
-) -> NumberingInfo {
+) -> Option<NumberingInfo> {
+    if num_map.check_counter_error().is_err() {
+        return None;
+    }
     let (
         format,
         indent_left,
@@ -4985,8 +5010,20 @@ fn resolve_numbering_marker(
                 None,
             )
         });
-    let counter = num_map.advance(num_id, num_level);
-    let text = num_map.resolve_text(num_id, num_level, counter);
+    let counter = match num_map.advance(num_id, num_level) {
+        Ok(counter) => counter,
+        Err(error) => {
+            num_map.record_counter_error(error);
+            return None;
+        }
+    };
+    let text = match num_map.resolve_text(num_id, num_level, counter) {
+        Ok(text) => text,
+        Err(error) => {
+            num_map.record_counter_error(error);
+            return None;
+        }
+    };
     let (pic_bullet_image_path, pic_bullet_mime_type, pic_bullet_width_pt, pic_bullet_height_pt) =
         match picture_bullet {
             // §17.9.20 defines no default size; absence stays absent so layout can
@@ -5000,7 +5037,7 @@ fn resolve_numbering_marker(
             None => (None, None, None, None),
         };
 
-    NumberingInfo {
+    Some(NumberingInfo {
         num_id,
         level: num_level,
         format,
@@ -5018,7 +5055,7 @@ fn resolve_numbering_marker(
         pic_bullet_mime_type,
         pic_bullet_width_pt,
         pic_bullet_height_pt,
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5115,9 +5152,7 @@ fn parse_paragraph_cond_at_depth_with_diagnostics(
     let numbering = if let (Some(num_id), Some(num_level)) = (base_para.num_id, base_para.num_level)
     {
         if num_id != 0 {
-            Some(Box::new(resolve_numbering_marker(
-                num_map, num_id, num_level, &mark_run, theme,
-            )))
+            resolve_numbering_marker(num_map, num_id, num_level, &mark_run, theme).map(Box::new)
         } else {
             None
         }
@@ -10451,9 +10486,7 @@ fn extract_simple_paragraph_text(
             return None;
         }
         let num_level = direct_ind.num_level.or(style_para.num_level).unwrap_or(0);
-        Some(Box::new(resolve_numbering_marker(
-            num_map, num_id, num_level, &mark_run, theme,
-        )))
+        resolve_numbering_marker(num_map, num_id, num_level, &mark_run, theme).map(Box::new)
     });
     let level = numbering
         .as_ref()
@@ -29394,6 +29427,45 @@ mod streamed_body_equivalence_tests {
             serde_json::to_value(streamed).unwrap(),
             serde_json::to_value(compatibility).unwrap()
         );
+    }
+
+    #[test]
+    fn title_page_honors_boolean_values_in_final_and_streamed_sections() {
+        // ECMA-376 17.10.6 / 17.17.4: absence is false; an empty
+        // titlePg is true, but explicit false is NOT element presence.
+        for w in [wordprocessingml::TRANSITIONAL, wordprocessingml::STRICT] {
+            for (toggle, expected) in [
+                ("", false),
+                ("<w:titlePg/>", true),
+                ("<w:titlePg w:val=\"1\"/>", true),
+                ("<w:titlePg w:val=\"true\"/>", true),
+                ("<w:titlePg w:val=\"on\"/>", true),
+                ("<w:titlePg w:val=\"0\"/>", false),
+                ("<w:titlePg w:val=\"false\"/>", false),
+                ("<w:titlePg w:val=\"off\"/>", false),
+            ] {
+                let xml = format!(
+                    r#"<w:document xmlns:w="{w}"><w:body>
+                  <w:p><w:pPr><w:sectPr>{toggle}</w:sectPr></w:pPr><w:r><w:t>A</w:t></w:r></w:p>
+                  <w:p><w:r><w:t>B</w:t></w:r></w:p><w:sectPr>{toggle}</w:sectPr>
+                </w:body></w:document>"#
+                );
+                let data = build_docx(&xml);
+                for parser in [parse, parse_streamed] {
+                    let document = parse_with(&data, parser);
+                    assert_eq!(document.section.title_page, expected, "{toggle}");
+                    let flags: Vec<_> = document
+                        .body
+                        .iter()
+                        .filter_map(|element| match element {
+                            BodyElement::SectionBreak { title_page, .. } => Some(*title_page),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(flags, [expected], "{toggle}");
+                }
+            }
+        }
     }
 
     #[test]

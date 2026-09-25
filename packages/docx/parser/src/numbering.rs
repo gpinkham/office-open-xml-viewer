@@ -3,7 +3,44 @@ use crate::xml_util::*;
 use ooxml_common::blip::mime_from_ext;
 use ooxml_common::depth::parse_guarded;
 use ooxml_common::ns::{attr_ns, relationships};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
+/// Typed failure of numbering counter state. Every variant is an
+/// implementation resource policy, not an OOXML schema limit: the caller
+/// rejects the document instead of emitting a marker from wrapped, truncated or
+/// unbounded counter state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CounterError {
+    /// Outside this model's nine supported levels (0..=8). CT_AbstractNum
+    /// permits at most nine `w:lvl` children, but `w:ilvl` itself is
+    /// ST_DecimalNumber (ECMA-376 §17.9.3), so this is not an XSD restriction.
+    InvalidLevel,
+    /// A checked counter increment exceeded `u32`.
+    Overflow,
+    /// The marker would exceed [`MAX_MARKER_BYTES`].
+    OutputTooLarge,
+}
+
+/// Per-marker retained UTF-8 ceiling. This is an implementation resource
+/// policy, not an OOXML schema limit or compatibility heuristic.
+const MAX_MARKER_BYTES: usize = 64 * 1024;
+
+/// Levels 0..=8: the nine levels a CT_AbstractNum can define.
+const MAX_SUPPORTED_LEVEL: u32 = 8;
+
+#[cfg(test)]
+#[path = "numbering/restart_tests.rs"]
+mod restart_tests;
+
+#[cfg(test)]
+#[path = "numbering/legal_tests.rs"]
+mod legal_tests;
+
+#[cfg(test)]
+#[path = "numbering/counter_instance_tests.rs"]
+mod counter_instance_tests;
 
 /// Parse a single VML CSS length (e.g. `width:9pt`) from a `style` attribute
 /// into pt. Supports the units Word emits for picture-bullet shapes: `pt`
@@ -54,6 +91,12 @@ pub struct LevelDef {
     /// numerals), or "center". `<w:start>` is unrelated.
     pub lvl_jc: String,
     pub start: u32,
+    /// ECMA-376 17.9.10: one-based last ancestor that resets this level.
+    /// Zero means never; absence (or an invalid index) uses the previous level.
+    restart: Option<u32>,
+    /// ECMA-376 17.9.4: use decimal for every placeholder in this level's
+    /// marker, without changing the referenced levels' own number formats.
+    legal: bool,
     /// ECMA-376 §17.9.6 `<w:lvl><w:rPr>` — the level's run (character) properties
     /// for the number/bullet glyph itself. Merged OVER the paragraph's resolved
     /// run formatting at use-site so the marker's font axes (ascii/eastAsia)
@@ -113,6 +156,8 @@ impl Default for LevelDef {
             suff: "tab".to_string(),
             lvl_jc: "left".to_string(),
             start: 1,
+            restart: None,
+            legal: false,
             rpr: RunFmt::default(),
             pic_bullet: None,
             p_style: None,
@@ -126,7 +171,7 @@ impl Default for LevelDef {
 /// happens to equal a real abstractNumId would otherwise hijack that abstract's
 /// live count. `Abstract` holds the shared count for a resolved num; `OrphanNum`
 /// gives an unresolved num its own disjoint counter.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum CounterKey {
     Abstract(u32),
     OrphanNum(u32),
@@ -143,26 +188,33 @@ pub struct NumberingMap {
     /// ECMA-376 §17.9.7 — numId → per-level FULL `<w:lvl>` replacements from
     /// `<w:num><w:lvlOverride><w:lvl>`: "the numbering level formatting which
     /// shall be substituted for the given numbering level of the abstract
-    /// definition". Formatting only — the abstract's shared running counter is
-    /// untouched (a restart needs `<w:startOverride>`, §17.9.27, tracked in
-    /// `num_overrides`). Consulted before the abstract's levels in `get_level`,
+    /// definition". A replacement alone does not immediately restart a live
+    /// counter (`startOverride`, tracked in `num_overrides`, does that). Its
+    /// `lvlRestart` still controls later ancestor-triggered resets. Consulted
+    /// before the abstract's levels in `get_level`,
     /// so lvlText/numFmt/indents/rPr/pStyle all substitute per-numId.
     num_level_overrides: HashMap<u32, HashMap<u32, LevelDef>>,
-    /// per-**abstractNumId** per-level counter. ECMA-376 §17.9: the running
-    /// count belongs to the abstract numbering definition, so every `<w:num>`
-    /// (numId) that references the same `<w:abstractNum>` shares one counter —
-    /// that is how Word's "continue previous list" works and how a restart on
-    /// one numId carries into the next (sample-13's masthead: numId=30 with a
-    /// `<w:startOverride>` restarts abstractNumId 20 to 1, then the body's
-    /// numId=6 — same abstract — continues 2, 3, 4 rather than resuming its own
-    /// page-1 tail at 5, 6, 7). Keyed by `CounterKey` so an unresolved numId
-    /// gets a disjoint counter instead of colliding with an abstractNumId.
+    /// Per-**abstractNumId** per-level counter. ECMA-376 §17.9.1 and §17.9.15
+    /// define abstract numbering definitions and concrete numbering instances;
+    /// they do not by themselves establish this runtime counter-store policy.
+    /// The §17.9.26 `startOverride` example establishes shared restart behavior:
+    /// numIds 5, 5, 6, 5 on one abstractNum produce 1, 2, 1, 2. The wider alias
+    /// and full-level-replacement policy is bounded native-Word compatibility
+    /// evidence (see `counter_instance_tests`). Keyed by `CounterKey` so an
+    /// unresolved numId gets a disjoint counter instead of colliding with an
+    /// abstractNumId.
     counters: HashMap<CounterKey, HashMap<u32, u32>>,
     /// (numId, level) pairs already advanced at least once. A numId carrying a
     /// `<w:lvlOverride><w:startOverride>` restarts the shared abstract counter
-    /// only on its FIRST appearance at that level (§17.9.6 / §17.9.7); afterward
-    /// it increments the shared counter like any other num on the abstract.
+    /// only on its FIRST appearance at that level. ECMA-376 §17.9.26 defines
+    /// `startOverride` and demonstrates its reset propagating across numIds on
+    /// one abstractNum; applying it only once per numId follows measured
+    /// native-Word compatibility behavior.
     started: HashSet<(u32, u32)>,
+    /// First counter failure, shared by every clone of this map. Text-box and
+    /// other story parsers advance cloned snapshots; the failure must still
+    /// reach the document-level check instead of disappearing with the clone.
+    counter_error: Rc<Cell<Option<CounterError>>>,
 }
 
 /// Parse one `<w:lvl>` element (ECMA-376 §17.9.6) into a [`LevelDef`].
@@ -182,6 +234,13 @@ fn parse_level_def(
         .and_then(|n| attr_w(n, "val"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
+    // ECMA-376 17.9.10 also applies to complete level replacements (17.9.5).
+    // MS-OE376 2.1.285(b) records Word ignoring this property in replacements;
+    // keep the normative OOXML behavior instead of adding an Office heuristic.
+    let restart = child_w(lvl_node, "lvlRestart")
+        .and_then(|n| attr_w(n, "val"))
+        .and_then(|v| v.parse::<u32>().ok());
+    let legal = bool_prop(lvl_node, "isLgl").unwrap_or(false);
     let format = child_w(lvl_node, "numFmt")
         .and_then(|n| attr_w(n, "val"))
         .unwrap_or_else(|| "decimal".to_string());
@@ -256,6 +315,8 @@ fn parse_level_def(
         suff,
         lvl_jc,
         start,
+        restart,
+        legal,
         rpr,
         pic_bullet,
         p_style,
@@ -367,7 +428,7 @@ impl NumberingMap {
                     overrides.insert(ilvl, start_ov.parse().unwrap_or(1));
                 }
                 // §17.9.7 — a FULL <w:lvl> child substitutes the level's
-                // definition for this numId (formatting only; no restart).
+                // definition for this numId, without an immediate restart.
                 if let Some(lvl_node) = child_w(lvl_ov, "lvl") {
                     level_overrides
                         .insert(ilvl, parse_level_def(lvl_node, ilvl as usize, &pic_bullets));
@@ -408,7 +469,8 @@ impl NumberingMap {
     /// [`Self::get_level`] so a backlink carried by a per-numId `<w:lvlOverride>`
     /// substitution (§17.9.7) participates too. `None` ⇒ the list has no
     /// association for this style (or the numId dangles). WordprocessingML caps
-    /// lists at 9 levels (ST_Ilvl, §17.18.38).
+    /// This model supports nine levels, matching CT_AbstractNum's maximum of
+    /// nine lvl children (§A.1); ilvl itself uses ST_DecimalNumber (§17.9.3).
     pub fn level_for_style(&self, num_id: u32, style_id: &str) -> Option<u32> {
         (0..9).find(|&l| {
             self.get_level(num_id, l)
@@ -426,19 +488,29 @@ impl NumberingMap {
     /// Advance the counter for (numId, level), resetting deeper levels.
     ///
     /// The counter is keyed by the numId's **abstractNumId**, so all numIds that
-    /// share an abstract definition advance one running count (§17.9 — see the
-    /// `counters` field doc). Each level stores its CURRENT displayed value (not
+    /// share an abstract definition advance one running count. This storage
+    /// policy follows measured native-Word behavior; see the `counters` field
+    /// doc and `counter_instance_tests`. Each level stores its CURRENT value (not
     /// the next): a level's first appearance shows its `start`, each later
-    /// advance adds one, and advancing a level clears all deeper levels (§17.9.25
-    /// default `lvlRestart`). Shallower levels are seeded to their `start` so an
+    /// advance adds one. Advancing a level resets descendants whose effective
+    /// `lvlRestart` includes that ancestor (17.9.10); by default this means all
+    /// deeper levels. Shallower levels are seeded to their `start` so an
     /// ancestor that only prefixes the marker (e.g. `%1.%2`) still resolves when
     /// it is never advanced on its own.
     ///
     /// A numId whose `<w:lvlOverride>` carries a `<w:startOverride>` for this
     /// level RESTARTS the shared abstract counter to the override value on its
-    /// first appearance at that level (§17.9.6 / §17.9.7), then increments
-    /// normally. Returns the value to display.
-    pub fn advance(&mut self, num_id: u32, level: u32) -> u32 {
+    /// first appearance at that level, then increments normally. ECMA-376
+    /// §17.9.26 defines `startOverride` and demonstrates the shared reset with
+    /// numIds 5, 5, 6, 5 producing 1, 2, 1, 2. The once-per-numId application is
+    /// measured native-Word compatibility behavior. Returns the value to display.
+    ///
+    /// Fails before any allocation or mutation for an unsupported level, and
+    /// commits nothing when the checked increment overflows.
+    pub fn advance(&mut self, num_id: u32, level: u32) -> Result<u32, CounterError> {
+        if level > MAX_SUPPORTED_LEVEL {
+            return Err(CounterError::InvalidLevel);
+        }
         // Pre-compute start values to avoid borrow conflicts. `get_start`
         // already folds in any per-numId `<w:startOverride>` for the level.
         let starts: Vec<u32> = (0..=level).map(|l| self.get_start(num_id, l)).collect();
@@ -447,14 +519,44 @@ impl NumberingMap {
             .num_overrides
             .get(&num_id)
             .is_some_and(|m| m.contains_key(&level));
-        // `insert` returns true when the pair was NOT already present.
-        let first_for_num = self.started.insert((num_id, level));
+        let first_for_num = !self.started.contains(&(num_id, level));
 
+        // Resolve each live descendant's own policy, including a complete
+        // level replacement. A never-restarting parent does not shield its
+        // children, and merely seeding an ancestor is not an occurrence of it.
+        // Iterate existing counters, never an input-provided restart range.
+        let resets: Vec<u32> = self
+            .counters
+            .get(&key)
+            .into_iter()
+            .flat_map(|counts| counts.keys().copied())
+            .filter(|&deeper| {
+                let threshold = self
+                    .get_level(num_id, deeper)
+                    .and_then(|def| def.restart)
+                    .filter(|&value| value <= deeper)
+                    .unwrap_or(deeper);
+                deeper > level && level < threshold
+            })
+            .collect();
+
+        // A startOverride restarts the shared counter on first use of this num;
+        // otherwise the level shows `start` on its first appearance on the
+        // abstract and increments thereafter.
+        let val = if first_for_num && has_override {
+            starts[level as usize]
+        } else {
+            match self.counters.get(&key).and_then(|entry| entry.get(&level)) {
+                Some(&v) => v.checked_add(1).ok_or(CounterError::Overflow)?,
+                None => starts[level as usize],
+            }
+        };
+
+        // Commit only after every fallible calculation succeeded.
+        self.started.insert((num_id, level));
         let entry = self.counters.entry(key).or_default();
 
-        // Reset deeper levels (§17.9.25 default lvlRestart).
-        let keys: Vec<u32> = entry.keys().copied().filter(|&l| l > level).collect();
-        for k in keys {
+        for k in resets {
             entry.remove(&k);
         }
 
@@ -464,19 +566,8 @@ impl NumberingMap {
             entry.entry(lvl as u32).or_insert(start);
         }
 
-        // A startOverride restarts the shared counter on first use of this num;
-        // otherwise the level shows `start` on its first appearance on the
-        // abstract and increments thereafter.
-        let val = if first_for_num && has_override {
-            starts[level as usize]
-        } else {
-            match entry.get(&level) {
-                Some(&v) => v + 1,
-                None => starts[level as usize],
-            }
-        };
         entry.insert(level, val);
-        val
+        Ok(val)
     }
 
     /// The counter-map key for a numId: the shared `Abstract(abstractNumId)`
@@ -501,10 +592,24 @@ impl NumberingMap {
     /// its start, so an ancestor that is never itself advanced (e.g. a list
     /// whose level 0 only exists to prefix subsection numbers with a fixed
     /// `start`) still resolves to its start value.
-    pub fn resolve_text(&self, num_id: u32, level: u32, counter: u32) -> String {
+    ///
+    /// The marker is bounded by [`MAX_MARKER_BYTES`]; every replacement is
+    /// sized before it is allocated.
+    pub fn resolve_text(
+        &self,
+        num_id: u32,
+        level: u32,
+        counter: u32,
+    ) -> Result<String, CounterError> {
+        if level > MAX_SUPPORTED_LEVEL {
+            return Err(CounterError::InvalidLevel);
+        }
         let Some(lvl) = self.get_level(num_id, level) else {
-            return format!("{}.", counter);
+            return Ok(format!("{}.", counter));
         };
+        if lvl.text.len() > MAX_MARKER_BYTES {
+            return Err(CounterError::OutputTooLarge);
+        }
         let key = self.counter_key(num_id);
 
         let mut text = lvl.text.clone();
@@ -521,13 +626,58 @@ impl NumberingMap {
                     .copied()
                     .unwrap_or_else(|| self.get_start(num_id, k))
             };
-            let fmt = self
-                .get_level(num_id, k)
-                .map(|l| l.format.as_str())
-                .unwrap_or(lvl.format.as_str());
-            text = text.replace(&format!("%{}", k + 1), &format_counter(val, fmt));
+            // 17.9.4 applies to this marker's entire displayed level text,
+            // including its own placeholder. Keep authored formats intact so
+            // other markers continue to use their own definitions. MS-OE376
+            // 2.1.280(b) documents Word retaining `none`; this path follows the
+            // normative decimal rule, without a format-specific exception.
+            let fmt = if lvl.legal {
+                "decimal"
+            } else {
+                self.get_level(num_id, k)
+                    .map(|l| l.format.as_str())
+                    .unwrap_or(lvl.format.as_str())
+            };
+            let placeholder = format!("%{}", k + 1);
+            let occurrences = text.match_indices(&placeholder).count();
+            if occurrences == 0 {
+                continue;
+            }
+            let replacement = format_counter_bounded(val, fmt, MAX_MARKER_BYTES)
+                .map_err(|()| CounterError::OutputTooLarge)?;
+            let removed = occurrences
+                .checked_mul(placeholder.len())
+                .ok_or(CounterError::OutputTooLarge)?;
+            let inserted = occurrences
+                .checked_mul(replacement.len())
+                .ok_or(CounterError::OutputTooLarge)?;
+            text.len()
+                .checked_sub(removed)
+                .and_then(|len| len.checked_add(inserted))
+                .filter(|len| *len <= MAX_MARKER_BYTES)
+                .ok_or(CounterError::OutputTooLarge)?;
+            text = text.replace(&placeholder, &replacement);
         }
-        text
+        Ok(text)
+    }
+
+    /// Retain the first counter failure for the whole document.
+    pub fn record_counter_error(&self, error: CounterError) {
+        if self.counter_error.get().is_none() {
+            self.counter_error.set(Some(error));
+        }
+    }
+
+    /// Fail the document once any story recorded a counter failure.
+    pub fn check_counter_error(&self) -> Result<(), String> {
+        match self.counter_error.get() {
+            None => Ok(()),
+            Some(CounterError::InvalidLevel) => Err("unsupported numbering level".to_string()),
+            Some(CounterError::Overflow) => Err("numbering counter overflow".to_string()),
+            Some(CounterError::OutputTooLarge) => {
+                Err("numbering marker output too large".to_string())
+            }
+        }
     }
 }
 
@@ -539,7 +689,68 @@ impl NumberingMap {
 // touch a format here, mirror it there (and vice versa); the TS unit tests are
 // the reference values. `bullet` is a list-only concern (no §17.18.59 numeric
 // meaning) and stays Rust-only.
+/// Bound expansions before allocating them. Non-repeating formats below do
+/// bounded work on at most ten decimal digits; their small result is checked
+/// after formatting. This is a caller-owned byte budget, not a numeric cutoff.
+fn format_counter_bounded(n: u32, format: &str, limit: usize) -> Result<String, ()> {
+    if n != 0 {
+        let alphabet = match format {
+            "arabicAlpha" => Some(ARABIC_ALPHA),
+            "arabicAbjad" => Some(ARABIC_ABJAD),
+            "russianLower" => Some(RUSSIAN_LOWER),
+            "russianUpper" => Some(RUSSIAN_UPPER),
+            "thaiLetters" => Some(THAI_LETTERS),
+            "chosung" => Some(KOREAN_CHOSUNG),
+            "ganada" => Some(KOREAN_GANADA),
+            "hindiVowels" => Some(HINDI_VOWELS),
+            "hindiConsonants" => Some(HINDI_CONSONANTS),
+            "aiueoFullWidth" => Some(KATAKANA_FULLWIDTH),
+            "aiueo" => Some(KATAKANA_HALFWIDTH),
+            _ => None,
+        };
+        let expanded_bytes = if let Some(glyphs) = alphabet {
+            let size = glyphs.len() as u64;
+            let index = (u64::from(n) - 1) % size;
+            let repeats = (u64::from(n) - 1) / size + 1;
+            Some(repeats * glyphs[index as usize].len() as u64)
+        } else {
+            match format {
+                "upperLetter" | "lowerLetter" => Some((u64::from(n) - 1) / 26 + 1),
+                "hebrew2" => {
+                    let repeats = (u64::from(n) - 1) / HEBREW_ALPHABET.len() as u64;
+                    let index = (u64::from(n) - 1) % HEBREW_ALPHABET.len() as u64;
+                    Some(HEBREW_ALPHABET[index as usize].len() as u64 + repeats * "ת".len() as u64)
+                }
+                "upperRoman" | "lowerRoman" => {
+                    let mut remaining = n;
+                    let mut bytes = 0u64;
+                    for (value, glyph) in ROMAN_DIGITS {
+                        bytes += u64::from(remaining / value) * glyph.len() as u64;
+                        remaining %= value;
+                    }
+                    Some(bytes)
+                }
+                _ => None,
+            }
+        };
+        if expanded_bytes.is_some_and(|bytes| bytes > limit as u64) {
+            return Err(());
+        }
+    }
+    let result = format_counter(n, format);
+    if result.len() > limit {
+        Err(())
+    } else {
+        Ok(result)
+    }
+}
+
 fn format_counter(n: u32, format: &str) -> String {
+    // ECMA-376 17.18.59: `none` suppresses the number, including start=0.
+    // Mirror the shared TS field formatter instead of using decimal fallback.
+    if format == "none" {
+        return String::new();
+    }
     if format == "bullet" {
         return "•".to_string();
     }
@@ -631,25 +842,26 @@ fn to_korean_legal(n: u32) -> String {
     )
 }
 
+const ROMAN_DIGITS: [(u32, &str); 13] = [
+    (1000, "M"),
+    (900, "CM"),
+    (500, "D"),
+    (400, "CD"),
+    (100, "C"),
+    (90, "XC"),
+    (50, "L"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+
 fn to_roman(n: u32) -> String {
-    let vals = [
-        (1000, "M"),
-        (900, "CM"),
-        (500, "D"),
-        (400, "CD"),
-        (100, "C"),
-        (90, "XC"),
-        (50, "L"),
-        (40, "XL"),
-        (10, "X"),
-        (9, "IX"),
-        (5, "V"),
-        (4, "IV"),
-        (1, "I"),
-    ];
     let mut n = n;
     let mut s = String::new();
-    for (v, r) in &vals {
+    for (v, r) in &ROMAN_DIGITS {
         while n >= *v {
             s.push_str(r);
             n -= v;
@@ -1176,12 +1388,12 @@ mod tests {
                  <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl>
                </w:abstractNum>
                <w:num w:numId="5"><w:abstractNumId w:val="5"/></w:num>"#);
-        let c1 = m.advance(5, 1);
-        assert_eq!(m.resolve_text(5, 1, c1), "3.1");
-        let c2 = m.advance(5, 1);
-        assert_eq!(m.resolve_text(5, 1, c2), "3.2");
-        let c3 = m.advance(5, 1);
-        assert_eq!(m.resolve_text(5, 1, c3), "3.3");
+        let c1 = m.advance(5, 1).unwrap();
+        assert_eq!(m.resolve_text(5, 1, c1).unwrap(), "3.1");
+        let c2 = m.advance(5, 1).unwrap();
+        assert_eq!(m.resolve_text(5, 1, c2).unwrap(), "3.2");
+        let c3 = m.advance(5, 1).unwrap();
+        assert_eq!(m.resolve_text(5, 1, c3).unwrap(), "3.3");
     }
 
     /// Parent counter is tracked live and resets deeper levels: 1, 1.1, 1.2,
@@ -1193,16 +1405,16 @@ mod tests {
                  <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl>
                </w:abstractNum>
                <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>"#);
-        let a = m.advance(1, 0);
-        assert_eq!(m.resolve_text(1, 0, a), "1.");
-        let b = m.advance(1, 1);
-        assert_eq!(m.resolve_text(1, 1, b), "1.1");
-        let c = m.advance(1, 1);
-        assert_eq!(m.resolve_text(1, 1, c), "1.2");
-        let d = m.advance(1, 0);
-        assert_eq!(m.resolve_text(1, 0, d), "2.");
-        let e = m.advance(1, 1);
-        assert_eq!(m.resolve_text(1, 1, e), "2.1"); // deeper level reset on parent advance
+        let a = m.advance(1, 0).unwrap();
+        assert_eq!(m.resolve_text(1, 0, a).unwrap(), "1.");
+        let b = m.advance(1, 1).unwrap();
+        assert_eq!(m.resolve_text(1, 1, b).unwrap(), "1.1");
+        let c = m.advance(1, 1).unwrap();
+        assert_eq!(m.resolve_text(1, 1, c).unwrap(), "1.2");
+        let d = m.advance(1, 0).unwrap();
+        assert_eq!(m.resolve_text(1, 0, d).unwrap(), "2.");
+        let e = m.advance(1, 1).unwrap();
+        assert_eq!(m.resolve_text(1, 1, e).unwrap(), "2.1"); // deeper level reset on parent advance
     }
 
     /// Each level's `%N` is formatted with its OWN numFmt (§17.9.11): an
@@ -1214,17 +1426,14 @@ mod tests {
                  <w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2"/></w:lvl>
                </w:abstractNum>
                <w:num w:numId="2"><w:abstractNumId w:val="2"/></w:num>"#);
-        m.advance(2, 0);
-        let c = m.advance(2, 1);
-        assert_eq!(m.resolve_text(2, 1, c), "A.1");
+        m.advance(2, 0).unwrap();
+        let c = m.advance(2, 1).unwrap();
+        assert_eq!(m.resolve_text(2, 1, c).unwrap(), "A.1");
     }
 
-    /// §17.9 — two numIds that reference the SAME abstractNum share one running
-    /// counter. sample-13's masthead: the article body numbers headings with
-    /// numId=6 (1..4), then a section restarts via numId=30 (same abstract 20,
-    /// a `<w:startOverride w:val="1"/>`) and the body resumes with numId=6. Word
-    /// shows 1, 2, 3, 4 across the restart — NOT 5, 6, 7 — because the count is
-    /// owned by abstract 20, not by each numId.
+    /// ECMA-376 §17.9.26 demonstrates that two numIds referencing one abstractNum
+    /// share a restart: the sequence 5, 5, 6, 5 produces 1, 2, 1, 2 when numId 6
+    /// has startOverride=1. This test exercises the same specified transition.
     #[test]
     fn shared_abstract_counter_restarts_on_start_override() {
         let mut m = map(r#"<w:abstractNum w:abstractNumId="20">
@@ -1236,16 +1445,16 @@ mod tests {
                </w:num>"#);
         // Article body (numId=6): 1, 2, 3, 4.
         for expected in ["1.", "2.", "3.", "4."] {
-            let c = m.advance(6, 0);
-            assert_eq!(m.resolve_text(6, 0, c), expected);
+            let c = m.advance(6, 0).unwrap();
+            assert_eq!(m.resolve_text(6, 0, c).unwrap(), expected);
         }
         // Masthead heading restarts the shared abstract counter to 1 (numId=30).
-        let c = m.advance(30, 0);
-        assert_eq!(m.resolve_text(30, 0, c), "1.");
+        let c = m.advance(30, 0).unwrap();
+        assert_eq!(m.resolve_text(30, 0, c).unwrap(), "1.");
         // Body resumes with numId=6 — continues the restarted count: 2, 3, 4.
         for expected in ["2.", "3.", "4."] {
-            let c = m.advance(6, 0);
-            assert_eq!(m.resolve_text(6, 0, c), expected);
+            let c = m.advance(6, 0).unwrap();
+            assert_eq!(m.resolve_text(6, 0, c).unwrap(), expected);
         }
     }
 
@@ -1258,12 +1467,12 @@ mod tests {
                </w:abstractNum>
                <w:num w:numId="1"><w:abstractNumId w:val="7"/></w:num>
                <w:num w:numId="2"><w:abstractNumId w:val="7"/></w:num>"#);
-        let a = m.advance(1, 0);
-        assert_eq!(m.resolve_text(1, 0, a), "1.");
-        let b = m.advance(2, 0); // different numId, same abstract ⇒ continues
-        assert_eq!(m.resolve_text(2, 0, b), "2.");
-        let c = m.advance(1, 0);
-        assert_eq!(m.resolve_text(1, 0, c), "3.");
+        let a = m.advance(1, 0).unwrap();
+        assert_eq!(m.resolve_text(1, 0, a).unwrap(), "1.");
+        let b = m.advance(2, 0).unwrap(); // different numId, same abstract ⇒ continues
+        assert_eq!(m.resolve_text(2, 0, b).unwrap(), "2.");
+        let c = m.advance(1, 0).unwrap();
+        assert_eq!(m.resolve_text(1, 0, c).unwrap(), "3.");
     }
 
     /// A dangling numId (no `<w:num>`) whose value equals a live abstractNumId
@@ -1276,12 +1485,12 @@ mod tests {
                  <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
                </w:abstractNum>
                <w:num w:numId="5"><w:abstractNumId w:val="4"/></w:num>"#);
-        let a = m.advance(5, 0);
-        assert_eq!(m.resolve_text(5, 0, a), "1.");
+        let a = m.advance(5, 0).unwrap();
+        assert_eq!(m.resolve_text(5, 0, a).unwrap(), "1.");
         // numId 4 has no <w:num>; it must start its own count at 1, not read
         // abstractNumId 4's counter (which would yield 2).
-        let b = m.advance(4, 0);
-        assert_eq!(m.resolve_text(4, 0, b), "1.");
+        let b = m.advance(4, 0).unwrap();
+        assert_eq!(m.resolve_text(4, 0, b).unwrap(), "1.");
     }
 
     /// ECMA-376 §17.18.59 — the Rust `format_counter` MUST match the core TS
@@ -1463,7 +1672,7 @@ mod tests {
             // Documented residual / spell-outs fall back to decimal.
             ("cardinalText", &[(5, "5")]),
             ("thaiCounting", &[(5, "5")]),
-            ("none", &[(5, "5")]),
+            ("none", &[(0, ""), (1, ""), (5, "")]),
         ];
         for (fmt, rows) in cases {
             for (input, expected) in *rows {
@@ -1484,9 +1693,134 @@ mod tests {
                  <w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="ideographDigital"/><w:lvlText w:val="%1."/></w:lvl>
                </w:abstractNum>
                <w:num w:numId="9"><w:abstractNumId w:val="9"/></w:num>"#);
-        let a = m.advance(9, 0);
-        assert_eq!(m.resolve_text(9, 0, a), "一."); // 1 → 一
-        let b = m.advance(9, 0);
-        assert_eq!(m.resolve_text(9, 0, b), "二."); // 2 → 二
+        let a = m.advance(9, 0).unwrap();
+        assert_eq!(m.resolve_text(9, 0, a).unwrap(), "一."); // 1 → 一
+        let b = m.advance(9, 0).unwrap();
+        assert_eq!(m.resolve_text(9, 0, b).unwrap(), "二."); // 2 → 二
+    }
+
+    #[test]
+    fn clones_share_first_failure_but_keep_independent_counter_state() {
+        let mut original = map(
+            r#"<w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>"#,
+        );
+        let mut cloned = original.clone();
+        assert_eq!(original.advance(1, 0), Ok(1));
+        assert_eq!(cloned.advance(1, 0), Ok(1));
+        original.record_counter_error(CounterError::Overflow);
+        cloned.record_counter_error(CounterError::InvalidLevel);
+        assert_eq!(
+            original.check_counter_error(),
+            Err("numbering counter overflow".to_string())
+        );
+        assert_eq!(cloned.check_counter_error(), original.check_counter_error());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn expanding_formats_reject_huge_values_before_allocating() {
+        for format in [
+            "upperLetter",
+            "lowerLetter",
+            "upperRoman",
+            "lowerRoman",
+            "arabicAlpha",
+            "arabicAbjad",
+            "russianLower",
+            "russianUpper",
+            "thaiLetters",
+            "chosung",
+            "ganada",
+            "hindiVowels",
+            "hindiConsonants",
+            "aiueoFullWidth",
+            "aiueo",
+            "hebrew2",
+        ] {
+            assert!(
+                format_counter_bounded(u32::MAX, format, 64).is_err(),
+                "{format}"
+            );
+            for n in [0, 1, 22, 26, 27, 48, 49, 123, 1999] {
+                let expected = format_counter(n, format);
+                assert_eq!(
+                    format_counter_bounded(n, format, expected.len()),
+                    Ok(expected.clone())
+                );
+                if !expected.is_empty() {
+                    assert!(format_counter_bounded(n, format, expected.len() - 1).is_err());
+                }
+            }
+        }
+    }
+
+    fn marker(text: &str, counter: u32, format: &str) -> Result<String, CounterError> {
+        let xml = format!(
+            r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0">
+                <w:start w:val="1"/><w:numFmt w:val="{format}"/><w:lvlText w:val="{text}"/>
+              </w:lvl></w:abstractNum>
+              <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+            </w:numbering>"#
+        );
+        NumberingMap::parse(&xml, &HashMap::new()).resolve_text(1, 0, counter)
+    }
+
+    #[test]
+    fn marker_budget_accepts_exact_size_and_rejects_one_over() {
+        let exact = "x".repeat(MAX_MARKER_BYTES);
+        assert_eq!(
+            marker(&exact, 1, "decimal").unwrap().len(),
+            MAX_MARKER_BYTES
+        );
+        let over = "x".repeat(MAX_MARKER_BYTES + 1);
+        assert_eq!(
+            marker(&over, 1, "decimal"),
+            Err(CounterError::OutputTooLarge)
+        );
+    }
+
+    #[test]
+    fn repeated_placeholders_are_checked_before_replacement() {
+        let fitting = "%1".repeat(MAX_MARKER_BYTES / 4);
+        assert_eq!(
+            marker(&fitting, 8, "upperRoman").unwrap().len(),
+            MAX_MARKER_BYTES
+        );
+        let expanding = "%1".repeat(MAX_MARKER_BYTES / 4 + 1);
+        assert_eq!(
+            marker(&expanding, 8, "upperRoman"),
+            Err(CounterError::OutputTooLarge)
+        );
+    }
+
+    #[test]
+    fn invalid_levels_and_overflow_fail_without_committing_state() {
+        let xml = r#"<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+              <w:abstractNum w:abstractNumId="0">
+                <w:lvl w:ilvl="0"><w:start w:val="4294967295"/></w:lvl>
+                <w:lvl w:ilvl="1"><w:start w:val="7"/></w:lvl>
+              </w:abstractNum>
+              <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+            </w:numbering>"#;
+        let mut map = NumberingMap::parse(xml, &HashMap::new());
+        assert_eq!(map.advance(1, 9), Err(CounterError::InvalidLevel));
+        assert_eq!(
+            map.resolve_text(1, u32::MAX, 1),
+            Err(CounterError::InvalidLevel)
+        );
+        assert!(map.counters.is_empty() && map.started.is_empty());
+        assert_eq!(map.advance(1, 0), Ok(u32::MAX));
+        assert_eq!(map.advance(1, 1), Ok(7));
+        // A committed level-0 advance would also reset the live level 1.
+        let before = map.counters.clone();
+        let started = map.started.clone();
+        assert_eq!(map.advance(1, 0), Err(CounterError::Overflow));
+        assert_eq!(map.counters, before);
+        assert_eq!(map.started, started);
     }
 }
