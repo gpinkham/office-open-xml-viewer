@@ -45,3 +45,22 @@ it('keeps preview tables separate when they have no source-model locator', async
   await expect(find.find('Hello')).resolves.toHaveLength(1);
   await expect(find.find('Helloworld')).resolves.toEqual([]);
 });
+
+it('searches several terms at once, with whole words, and an all-empty list clears', async () => {
+  const slides = [[run('the cat sat')], [run('a concatenated dog')]];
+  const find = new PptxFindController(() => slides.length, async (slide) => slides[slide]);
+  const matches = await find.find(['dog', 'cat'], { wholeWord: true });
+  expect(matches.map((m) => [m.location.slide, m.text])).toEqual([[0, 'cat'], [1, 'dog']]);
+  expect(await find.find([''])).toEqual([]);
+  expect(find.matches()).toEqual([]);
+});
+
+it("carries each term's colour into the matches and the highlights", async () => {
+  const slides = [[run('the cat and the dog')]];
+  const find = new PptxFindController(() => slides.length, async (slide) => slides[slide]);
+  const matches = await find.find([{ text: 'dog', color: 'red' }, 'cat']);
+  expect(matches.map((m) => [m.text, m.color])).toEqual([['cat', undefined], ['dog', 'red']]);
+  expect(find.slideHighlights(0).map((h) => h.color)).toEqual([undefined, 'red']);
+  expect(find.next()?.color).toBeUndefined();
+  expect(find.next()?.color).toBe('red');
+});

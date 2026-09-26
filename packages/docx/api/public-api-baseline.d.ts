@@ -1460,6 +1460,7 @@ export type DocxHighlightColors = FindHighlightColors;
 export interface DocxHighlightMatch {
     slices: MatchRunSlice[];
     active: boolean;
+    color?: string;
 }
 export interface DocxMatchLocation {
     page: number;
@@ -1503,7 +1504,7 @@ export class DocxScrollViewer implements ZoomableViewer {
         pageIndex?: number;
         behavior?: 'auto' | 'smooth';
     }): Promise<boolean>;
-    findText(query: string, opts?: FindMatchesOptions): Promise<FindMatch<DocxMatchLocation>[]>;
+    findText(query: FindQuery, opts?: FindMatchesOptions): Promise<FindMatch<DocxMatchLocation>[]>;
     findNext(): Promise<FindMatch<DocxMatchLocation> | null>;
     findPrev(): Promise<FindMatch<DocxMatchLocation> | null>;
     clearFind(): void;
@@ -1667,7 +1668,7 @@ export class DocxViewer implements ZoomableViewer {
     zoomOut(): Promise<void>;
     fitWidth(): Promise<void>;
     fitPage(): Promise<void>;
-    findText(query: string, opts?: FindMatchesOptions): Promise<FindMatch<DocxMatchLocation>[]>;
+    findText(query: FindQuery, opts?: FindMatchesOptions): Promise<FindMatch<DocxMatchLocation>[]>;
     findNext(): Promise<FindMatch<DocxMatchLocation> | null>;
     findPrev(): Promise<FindMatch<DocxMatchLocation> | null>;
     clearFind(): void;
@@ -1748,9 +1749,16 @@ export interface FindMatch<Loc = unknown> {
     matchIndex: number;
     text: string;
     location: Loc;
+    color?: string;
 }
 export interface FindMatchesOptions {
     caseSensitive?: boolean;
+    wholeWord?: boolean;
+}
+export type FindQuery = string | readonly (string | FindTerm)[];
+export interface FindTerm {
+    text: string;
+    color?: string;
 }
 export function fontCss(options: FontCssOptions): FontSource;
 export function fontCssApi(options: FontCssApiOptions): FontSource;

@@ -1,12 +1,14 @@
-import { buildTextIndex, findMatches } from '../search/text-index';
+import { buildTextIndex, findMatches, normalizeFindQuery, withFindColor } from '../search/text-index';
 import { nextActive, prevActive } from '../search/find-cursor';
-import type { FindMatchesOptions, SearchRun, TextMatch } from '../search/text-index';
+import type { FindMatchesOptions, FindQuery, SearchRun, TextMatch } from '../search/text-index';
 import type { FindMatch } from '../search/find-match';
 
 interface ResolvedMatch {
   unit: number;
   text: string;
   slices: TextMatch['slices'];
+  /** The colour of the term that found it, when that term set one. */
+  color?: string;
 }
 
 /** Search state for a sequence of rendered units. The adapter names the unit in
@@ -43,11 +45,11 @@ export class UnitFindController<Run extends SearchRun, Location> {
     this._runs.set(unit, runs);
   }
 
-  unitHighlights(unit: number): { slices: TextMatch['slices']; active: boolean }[] {
-    const out: { slices: TextMatch['slices']; active: boolean }[] = [];
+  unitHighlights(unit: number): { slices: TextMatch['slices']; active: boolean; color?: string }[] {
+    const out: { slices: TextMatch['slices']; active: boolean; color?: string }[] = [];
     for (let i = 0; i < this._matches.length; i++) {
       const match = this._matches[i];
-      if (match.unit === unit) out.push({ slices: match.slices, active: i === this._active });
+      if (match.unit === unit) out.push(withFindColor({ slices: match.slices, active: i === this._active }, match.color));
     }
     return out;
   }
@@ -55,15 +57,15 @@ export class UnitFindController<Run extends SearchRun, Location> {
   activeUnit(): number | null { return this._matches[this._active]?.unit ?? null; }
 
   matches(): FindMatch<Location>[] {
-    return this._matches.map((match, matchIndex) => ({
+    return this._matches.map((match, matchIndex) => withFindColor({
       matchIndex, text: match.text, location: this._location(match.unit),
-    }));
+    }, match.color));
   }
 
-  async find(query: string, opts: FindMatchesOptions = {}): Promise<FindMatch<Location>[]> {
+  async find(query: FindQuery, opts: FindMatchesOptions = {}): Promise<FindMatch<Location>[]> {
     const generation = ++this._generation;
     // Empty search is a full clear, including cached geometry, in both formats.
-    if (query.length === 0) {
+    if (normalizeFindQuery(query).length === 0) {
       this._runsRevision++;
       this._runs.clear();
       this._matches = [];
@@ -105,7 +107,7 @@ export class UnitFindController<Run extends SearchRun, Location> {
         if (!this._acceptMatch(runs, match.slices)) continue;
         const text = match.slices.map((slice) =>
           runs[slice.runIndex].text.slice(slice.start, slice.end)).join('');
-        matches.push({ unit, text, slices: match.slices });
+        matches.push(withFindColor({ unit, text, slices: match.slices }, match.color));
       }
     }
     this._runsRevision++;
@@ -127,6 +129,8 @@ export class UnitFindController<Run extends SearchRun, Location> {
 
   private _activePublic(): FindMatch<Location> | null {
     const match = this._matches[this._active];
-    return match ? { matchIndex: this._active, text: match.text, location: this._location(match.unit) } : null;
+    return match
+      ? withFindColor({ matchIndex: this._active, text: match.text, location: this._location(match.unit) }, match.color)
+      : null;
   }
 }

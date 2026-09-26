@@ -1318,9 +1318,16 @@ export interface FindMatch<Loc = unknown> {
     matchIndex: number;
     text: string;
     location: Loc;
+    color?: string;
 }
 export interface FindMatchesOptions {
     caseSensitive?: boolean;
+    wholeWord?: boolean;
+}
+export type FindQuery = string | readonly (string | FindTerm)[];
+export interface FindTerm {
+    text: string;
+    color?: string;
 }
 export function fontCss(options: FontCssOptions): FontSource;
 export function fontCssApi(options: FontCssApiOptions): FontSource;
@@ -2726,7 +2733,7 @@ export class XlsxSheetViewer implements ZoomableViewer {
     setHiddenSheetMode(mode: HiddenSheetMode): Promise<void>;
     get hiddenSheetMode(): HiddenSheetMode;
     get visibleSheetCount(): number;
-    findText(query: string, options?: FindMatchesOptions): Promise<FindMatch<XlsxMatchLocation>[]>;
+    findText(query: FindQuery, options?: FindMatchesOptions): Promise<FindMatch<XlsxMatchLocation>[]>;
     findNext(): Promise<FindMatch<XlsxMatchLocation> | null>;
     findPrev(): Promise<FindMatch<XlsxMatchLocation> | null>;
     clearFind(): void;
@@ -2804,7 +2811,7 @@ class XlsxViewerEngine implements ZoomableViewer {
     get hiddenSheetMode(): HiddenSheetMode;
     get visibleSheetCount(): number;
     copySelection(): Promise<XlsxCopyResult>;
-    findText(query: string, opts?: FindMatchesOptions): Promise<FindMatch<XlsxMatchLocation>[]>;
+    findText(query: FindQuery, opts?: FindMatchesOptions): Promise<FindMatch<XlsxMatchLocation>[]>;
     findNext(): Promise<FindMatch<XlsxMatchLocation> | null>;
     findPrev(): Promise<FindMatch<XlsxMatchLocation> | null>;
     clearFind(): void;

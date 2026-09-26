@@ -31,11 +31,13 @@ import type { DocxTextRunInfo } from './renderer';
 import { tateChuYokoOverlayScale } from './tate-chu-yoko-overlay';
 import { runOverlayMeasure } from './run-overlay-measure';
 
-/** One page's highlight input: the run-slices a match covers, and whether that
- *  match is the active one (emphasis colour). */
+/** One page's highlight input: the run-slices a match covers, whether that
+ *  match is the active one (emphasis colour), and the colour its term asked
+ *  for, if any. */
 export interface DocxHighlightMatch {
   slices: MatchRunSlice[];
   active: boolean;
+  color?: string;
 }
 
 /** Default highlight colours (browser find-bar palette): a soft yellow for
@@ -81,7 +83,7 @@ export function buildDocxHighlightLayer(
   const activeColor = colors.active ?? DEFAULT_FIND_ACTIVE_HIGHLIGHT;
 
   for (const match of matches) {
-    const fill = match.active ? activeColor : matchColor;
+    const fill = match.active ? activeColor : match.color ?? matchColor;
     for (const slice of match.slices) {
       const run = runs[slice.runIndex];
       if (!run) continue;
