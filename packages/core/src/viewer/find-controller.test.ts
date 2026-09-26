@@ -85,4 +85,23 @@ describe('UnitFindController', () => {
     expect(find.unitRuns(0)).toBeUndefined();
     expect(find.next()).toBeNull();
   });
+
+  it('searches several terms at once, and treats an all-empty list as a clear', async () => {
+    const find = controller([['the cat sat'], ['a concatenated dog']]);
+    const matches = await find.find(['dog', 'cat'], { wholeWord: true });
+    expect(matches.map((m) => [m.location.unit, m.text])).toEqual([[0, 'cat'], [1, 'dog']]);
+    expect(await find.find([''])).toEqual([]);
+    expect(find.matches()).toEqual([]);
+    expect(find.unitRuns(0)).toBeUndefined();
+  });
+
+  it("carries each term's colour into the matches and the highlights", async () => {
+    const find = controller([['the cat and the dog']]);
+    const matches = await find.find([{ text: 'dog', color: 'red' }, 'cat']);
+    expect(matches.map((m) => [m.text, m.color])).toEqual([['cat', undefined], ['dog', 'red']]);
+    expect(matches[0]).not.toHaveProperty('color');
+    expect(find.unitHighlights(0).map((h) => h.color)).toEqual([undefined, 'red']);
+    expect(find.next()?.color).toBeUndefined();
+    expect(find.next()?.color).toBe('red');
+  });
 });

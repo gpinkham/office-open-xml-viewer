@@ -27,6 +27,8 @@ import { createPptxRunFrame } from './run-frame-dom.js';
 export interface PptxHighlightMatch {
   slices: MatchRunSlice[];
   active: boolean;
+  /** The colour the match's term asked for, if any. */
+  color?: string;
 }
 
 /** Browser find-bar palette (translucent so glyphs stay legible). */
@@ -89,7 +91,7 @@ export function buildPptxHighlightLayer(
   };
 
   for (const match of matches) {
-    const fill = match.active ? activeColor : matchColor;
+    const fill = match.active ? activeColor : match.color ?? matchColor;
     for (const slice of match.slices) {
       const run = runs[slice.runIndex];
       if (!run) continue;
