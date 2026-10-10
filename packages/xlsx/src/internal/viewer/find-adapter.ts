@@ -1,4 +1,4 @@
-import type { FindHighlightColors, FindMatch, FindMatchesOptions } from '@silurus/ooxml-core';
+import type { FindHighlightColors, FindMatch, FindMatchesOptions, FindQuery } from '@silurus/ooxml-core';
 import type { Worksheet } from '../../types.js';
 import type { XlsxWorkbook } from '../../workbook.js';
 import { acquireXlsxWorksheet } from '../../workbook.js';
@@ -9,13 +9,16 @@ import type { SheetOverlayHost } from '../sheet-surface.js';
 const DEFAULT_FIND_HIGHLIGHT = 'color-mix(in srgb, #ffb300 8%, transparent)';
 const DEFAULT_FIND_ACTIVE_HIGHLIGHT = 'color-mix(in srgb, #fb8c00 8%, transparent)';
 
-/** Resolve an XLSX find box without altering a caller-provided CSS background. */
+/** Resolve an XLSX find box without altering a caller-provided CSS background.
+ *  `termColor` is the colour a match's term asked for; it replaces the match
+ *  colour, but never the active one. */
 export function findHighlightOverlayStyle(
   active: boolean,
   colors: FindHighlightColors = {},
+  termColor?: string,
 ): { border: string; background: string } {
   const accent = active ? '#fb8c00' : '#ffb300';
-  const custom = active ? colors.active : colors.match;
+  const custom = active ? colors.active : termColor ?? colors.match;
   const background = custom ?? (active ? DEFAULT_FIND_ACTIVE_HIGHLIGHT : DEFAULT_FIND_HIGHLIGHT);
   return { border: `2px solid ${custom ?? accent}`, background };
 }
@@ -109,7 +112,6 @@ export class FindAdapter {
     // the selection overlay uses. The active match uses a warm accent so it is
     // distinguishable from other hits and from the (blue) selection box.
     const colors = this.host.highlightColors();
-    const other = findHighlightOverlayStyle(false, colors);
     const active = findHighlightOverlayStyle(true, colors);
 
     for (const hl of this.controller.sheetHighlights(this.host.currentSheet())) {
@@ -125,7 +127,7 @@ export class FindAdapter {
       if (hl.row > freezeRows && y < frozenBoundY) { h -= frozenBoundY - y; y = frozenBoundY; }
       if (w <= 0 || h <= 0) continue;
       const screenLeft = this.host.screenX(x, w);
-      const { border, background } = hl.active ? active : other;
+      const { border, background } = hl.active ? active : findHighlightOverlayStyle(false, colors, hl.color);
       const box = this.host.ownerDocument.createElement('div');
       box.style.cssText =
         `position:absolute;` +
@@ -137,7 +139,7 @@ export class FindAdapter {
 
   /** Search every sheet and highlight the matches (see XlsxViewer.findText). */
   async find(
-    query: string,
+    query: FindQuery,
     opts: FindMatchesOptions = {},
   ): Promise<FindMatch<XlsxMatchLocation>[]> {
     if (!this.host.workbook()) return [];

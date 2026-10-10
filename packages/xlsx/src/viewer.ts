@@ -9,7 +9,7 @@ import {
 } from './workbook.js';
 import type { LoadOptions } from './workbook.js';
 import type { ViewportRange, Worksheet, XlsxChromeColors, XlsxComment } from './types.js';
-import type { FindHighlightColors, HyperlinkTarget, FindMatch, FindMatchesOptions, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
+import type { FindHighlightColors, HyperlinkTarget, FindMatch, FindMatchesOptions, FindQuery, OoxmlResourceMetrics, ViewerContextMenuEvent, ZoomableViewer } from '@silurus/ooxml-core';
 import { nextVisibleIndex, resolveVisibleIndex, countVisible, anchoredZoomOffset, openExternalHyperlink, nextZoomStep, prevZoomStep, fitScale } from '@silurus/ooxml-core';
 import {
   CallerCanvasMount,
@@ -2034,7 +2034,7 @@ class XlsxViewerEngine implements ZoomableViewer {
    * clears the find.
    */
   async findText(
-    query: string,
+    query: FindQuery,
     opts: FindMatchesOptions = {},
   ): Promise<FindMatch<XlsxMatchLocation>[]> {
     return this.finder.find(query, opts);
@@ -2856,7 +2856,7 @@ export class XlsxSheetViewer implements ZoomableViewer {
   }
 
   async findText(
-    query: string,
+    query: FindQuery,
     options?: FindMatchesOptions,
   ): Promise<FindMatch<XlsxMatchLocation>[]> {
     this.assertOpen();
