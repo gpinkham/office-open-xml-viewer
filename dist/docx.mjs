@@ -1,0 +1,12 @@
+import { t as e } from "./substitutions-_KDT_mVq.js";
+import { n as t, t as n } from "./ooxml-error-DbICW35n.js";
+import { f as r, u as i } from "./pixel-budget-DTyGSNrD.js";
+import { i as a, t as o } from "./tiff-contract-DEd8CGuz.js";
+import { C as s } from "./canvas-viewer-mechanics-Bfg_no04.js";
+import { a as c, o as l } from "./chart-context-DglXy_ax.js";
+import { r as u } from "./hyperlink-BOJHX05H.js";
+import { i as d, o as f, r as p, s as m } from "./source-GXgH3t1X.js";
+import { f as h, t as g } from "./document-Bb2PIl7f.js";
+import { n as _, r as v } from "./comments-B3a2O0op.js";
+import { a as y, i as b, n as x, o as S, r as C, s as w } from "./docx-CCVnbh7T.js";
+export { g as DocxDocument, C as DocxScrollViewer, b as DocxViewer, i as OoxmlDecodedImageLimitError, n as OoxmlError, t as OoxmlResourceLimitError, o as TiffDecodeError, s as autoResize, S as buildDocxHighlightLayer, w as buildDocxTextLayer, p as fontCss, d as fontCssApi, f as fontFiles, m as fontResolver, l as googleFonts, c as googleFontsSubstitutions, r as isOoxmlDecodedImageLimitError, a as isTiffDecodeError, x as noteText, e as officeFontSubstitutions, u as openExternalHyperlink, y as readDocxTextSelectionContext, _ as resolveCommentAnchorRuns, v as resolveDocxCommentThreads, h as resolveRevisionAnchorRuns };
