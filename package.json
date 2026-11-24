@@ -1,0 +1,53 @@
+{
+  "name": "@silurus/ooxml-opendocument",
+  "version": "0.90.0",
+  "description": "Optional OpenDocument (ODT, ODP, ODS) model sources for @silurus/ooxml",
+  "license": "MIT",
+  "author": "Yuki Yokotani <silurus.dev@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yukiyokotani/office-open-xml-viewer.git",
+    "directory": "packages/opendocument"
+  },
+  "homepage": "https://ooxml.silurus.dev",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    "./odt": {
+      "types": "./dist/types/odt.d.ts",
+      "import": "./dist/odt.mjs",
+      "default": "./dist/odt.mjs"
+    },
+    "./odp": {
+      "types": "./dist/types/odp.d.ts",
+      "import": "./dist/odp.mjs",
+      "default": "./dist/odp.mjs"
+    },
+    "./ods": {
+      "types": "./dist/types/ods.d.ts",
+      "import": "./dist/ods.mjs",
+      "default": "./dist/ods.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "keywords": [
+    "ooxml",
+    "opendocument",
+    "odt",
+    "odp",
+    "ods",
+    "viewer",
+    "wasm"
+  ],
+  "peerDependencies": {
+    "@silurus/ooxml": "0.90.0"
+  }
+}
